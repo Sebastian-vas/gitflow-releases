@@ -1,0 +1,345 @@
+name: Publicar Gitflow
+
+# Builds Gitflow for Linux, Windows and macOS and publishes the release in THIS public repository,
+# where GitHub Actions is free (the account's Actions are blocked for private repositories by billing).
+# The code is checked out from the PRIVATE repository Sebastian-vas/gitflow with a read-only deploy key
+# (secret GITFLOW_CODE_KEY); only the installers leave it. The installed apps update from these releases
+# (app/src/main-process/fork-updater.ts), so the file names below must not change.
+#
+# Start it from the code repository with script/publish-release.sh (it tags the next version, e.g.
+# v3.4.15-linux1-ai016, pushes the tag and runs this workflow), or by hand: Actions → "Publicar Gitflow"
+# → Run workflow, with a tag that already exists in the code repository. "publicar: false" only builds
+# (installers attached to the run).
+#
+# Only people with write access to this repository can start it (workflow_dispatch); pull requests from
+# forks can't, so the secrets are never exposed to them.
+#
+# Secrets of THIS repository:
+#   GITFLOW_CODE_KEY            private half of the deploy key (read-only) of Sebastian-vas/gitflow
+#   WINDOWS_CERTIFICATE_PFX     optional: Gitflow's own certificate (.pfx, base64), and
+#   WINDOWS_CERTIFICATE_PASSWORD
+#   AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET + variables WINDOWS_SIGNING_ACCOUNT,
+#     WINDOWS_SIGNING_PROFILE, WINDOWS_SIGNING_ENDPOINT: optional, Azure Trusted Signing
+#   RELEASES_TOKEN              only while the variable BRIDGE_REPOSITORY is set (transition: also
+#                               publish to the old public repository)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Etiqueta del repositorio de código (p. ej. v3.4.15-linux1-ai016)'
+        required: true
+      publicar:
+        description: 'Publicar la release (si no, solo compila)'
+        type: boolean
+        default: true
+
+# One release at a time
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 20.17.0
+  CODE_REPOSITORY: Sebastian-vas/gitflow
+  TAG: ${{ inputs.tag }}
+
+jobs:
+  linux:
+    name: Linux x64
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Builds inside Ubuntu 20.04 so the packages work on as many distributions as possible (older glibc),
+    # with the same dependencies and steps as shiftkey/desktop-ubuntu-amd64-packaging. apt falls back to
+    # the kernel.org mirror when Ubuntu's servers can't be reached (2026-11-11 DNS outage).
+    container: ubuntu:20.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      AS: as
+      STRIP: strip
+      AR: ar
+      CC: gcc
+      CPP: cpp
+      CXX: g++
+      LD: ld
+      FC: gfortran
+      PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig
+      npm_config_arch: x64
+    steps:
+      - name: Build dependencies
+        run: |
+          if ! apt-get update 2>&1 | tee /tmp/apt-update.log \
+              || grep -qE '^(Err|W: Failed to fetch)' /tmp/apt-update.log; then
+            echo "Ubuntu's servers unreachable, using mirrors.edge.kernel.org"
+            sed -i -e 's|http://archive.ubuntu.com/ubuntu|http://mirrors.edge.kernel.org/ubuntu|g' \
+              -e 's|http://security.ubuntu.com/ubuntu|http://mirrors.edge.kernel.org/ubuntu|g' \
+              /etc/apt/sources.list
+            apt-get update
+          fi
+          # openssh-client: the checkout of the private repository uses the deploy key
+          apt-get install -y software-properties-common lsb-release \
+            sudo wget curl build-essential jq autoconf automake \
+            pkg-config ca-certificates rpm git xz-utils openssh-client
+          apt-get install -y libasound2 libatk-bridge2.0-0 libatk1.0-0 \
+            libatspi2.0-0 libc6 libcairo2 libcups2 libdbus-1-3 libdrm2 \
+            libexpat1 libgbm1 libgcc1 libglib2.0-0 libgtk-3-0 libnspr4 \
+            libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 \
+            libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 \
+            libsecret-1-0
+          curl -sL "https://unofficial-builds.nodejs.org/download/release/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64-glibc-217.tar.xz" \
+            | xzcat | tar -x --strip-components=1 -C /usr/local/
+          npm install --global yarn
+          node --version
+          git --version
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.CODE_REPOSITORY }}
+          ref: ${{ env.TAG }}
+          ssh-key: ${{ secrets.GITFLOW_CODE_KEY }}
+          persist-credentials: false
+          submodules: recursive
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Set the version
+        run: node script/set-version-from-tag.js "${TAG}"
+      - name: Build and package
+        run: |
+          yarn
+          yarn run postinstall
+          yarn build:prod
+          yarn run package
+      - name: Test
+        run: |
+          yarn test:setup
+          yarn test:unit
+          yarn test:script
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-x64
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.AppImage
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      DESKTOP_CUSTOM_BUILD: '1'
+      npm_config_arch: x64
+      TARGET_ARCH: x64
+      # Authenticode signing (Azure Trusted Signing): on as soon as these variables and secrets exist
+      # in this repository (docs/firma-windows.md in the code repository).
+      WINDOWS_SIGNING_ACCOUNT: ${{ vars.WINDOWS_SIGNING_ACCOUNT }}
+      WINDOWS_SIGNING_PROFILE: ${{ vars.WINDOWS_SIGNING_PROFILE }}
+      WINDOWS_SIGNING_ENDPOINT: ${{ vars.WINDOWS_SIGNING_ENDPOINT }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      # Free alternative: Gitflow's own certificate (.pfx in base64), trusted on the team's computers
+      HAS_OWN_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE_PFX != '' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.CODE_REPOSITORY }}
+          ref: ${{ env.TAG }}
+          ssh-key: ${{ secrets.GITFLOW_CODE_KEY }}
+          persist-credentials: false
+          submodules: recursive
+      - name: Set the version
+        shell: bash
+        run: node script/set-version-from-tag.js "${TAG}"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: yarn
+      - run: yarn
+      - run: yarn build:prod
+      - name: Set up code signing
+        if: env.WINDOWS_SIGNING_ACCOUNT != ''
+        shell: pwsh
+        run: |
+          $acsZip = Join-Path $env:RUNNER_TEMP "acs.zip"
+          $acsDir = Join-Path $env:RUNNER_TEMP "acs"
+          Invoke-WebRequest -Uri https://www.nuget.org/api/v2/package/Microsoft.Trusted.Signing.Client/1.0.60 -OutFile $acsZip
+          Expand-Archive $acsZip -Destination $acsDir -Force
+          $sdk = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\10.*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          Copy-Item -Path (Join-Path $sdk.DirectoryName "*") -Include signtool.exe,*.manifest,mssign32.dll,wintrust.dll,AppxSip.dll,AppxPackaging.dll,OpcServices.dll -Destination "node_modules\electron-winstaller\vendor" -Force
+      - name: Set up Gitflow's own certificate
+        if: env.WINDOWS_SIGNING_ACCOUNT == '' && env.HAS_OWN_CERTIFICATE == 'true'
+        shell: pwsh
+        env:
+          PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+          PFX_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "gitflow-signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_BASE64))
+          "WINDOWS_CERTIFICATE_FILE=$pfx" >> $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force release | Out-Null
+          $cert = New-Object Security.Cryptography.X509Certificates.X509Certificate2($pfx, $env:PFX_PASSWORD)
+          [IO.File]::WriteAllBytes("release\Gitflow-certificado.cer", $cert.Export('Cert'))
+          Copy-Item script\windows-cert\instalar-certificado.ps1 release\Gitflow-instalar-certificado.ps1
+      - run: yarn package
+        env:
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      - name: Check the signature
+        if: env.WINDOWS_SIGNING_ACCOUNT != '' || env.HAS_OWN_CERTIFICATE == 'true'
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature dist\GitHubDesktopSetup-x64.exe
+          $sig | Format-List
+          if ($null -eq $sig.SignerCertificate) { throw "Setup.exe is not signed" }
+          if ($env:WINDOWS_SIGNING_ACCOUNT -ne '' -and $sig.Status -ne 'Valid') { throw "Invalid signature: $($sig.StatusMessage)" }
+      - name: Remove the certificate
+        if: always() && env.WINDOWS_CERTIFICATE_FILE != ''
+        shell: pwsh
+        run: Remove-Item -Force $env:WINDOWS_CERTIFICATE_FILE
+      - name: Collect installer and update package
+        shell: bash
+        run: |
+          mkdir -p release
+          cp dist/GitHubDesktopSetup-x64.exe release/Gitflow-Windows-x64-Setup.exe
+          cp dist/GitHubDesktop-*-x64-full.nupkg release/
+          sed 's/-full\.nupkg/-x64-full.nupkg/' dist/RELEASES > release/RELEASES
+          cat release/RELEASES
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64
+          path: release/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            arch: arm64
+          - os: macos-15-intel
+            arch: x64
+    env:
+      DESKTOP_CUSTOM_BUILD: '1'
+      npm_config_arch: ${{ matrix.arch }}
+      TARGET_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.CODE_REPOSITORY }}
+          ref: ${{ env.TAG }}
+          ssh-key: ${{ secrets.GITFLOW_CODE_KEY }}
+          persist-credentials: false
+          submodules: recursive
+      - name: Set the version
+        run: node script/set-version-from-tag.js "${TAG}"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: yarn
+      - run: yarn
+      - run: yarn build:prod
+      - run: yarn package
+      - name: Collect app
+        run: |
+          mkdir -p release
+          cp "dist/Gitflow-${{ matrix.arch }}.zip" "release/Gitflow-macOS-${{ matrix.arch }}.zip"
+          # Transition: apps from before the rename only look for this name
+          cp "dist/Gitflow-${{ matrix.arch }}.zip" "release/GitHubDesktop-macOS-${{ matrix.arch }}.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-${{ matrix.arch }}
+          path: release/*
+          if-no-files-found: error
+
+  publish:
+    name: Publicar la release
+    needs: [linux, windows, macos]
+    if: inputs.publicar
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.CODE_REPOSITORY }}
+          ref: ${{ env.TAG }}
+          ssh-key: ${{ secrets.GITFLOW_CODE_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Icon for Windows' installed apps list
+        run: cp app/static/logos/icon-logo.ico artifacts/Gitflow.ico
+      - name: Checksums
+        working-directory: artifacts
+        run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Release notes
+        run: |
+          previous=$(git describe --tags --abbrev=0 --match 'v*' "${TAG}^" 2>/dev/null || true)
+          {
+            echo "## What's new"
+            echo
+            if [ -n "$previous" ]; then
+              git log --no-merges --format='- %s' "${previous}..${TAG}" | sed 's/ \[skip ci\]//'
+            else
+              git log --no-merges --format='- %s' -20 "${TAG}"
+            fi
+            cat <<'NOTES'
+
+          ## Installers
+
+          | System | File |
+          |---|---|
+          | Linux (Debian/Ubuntu/Mint) | `.deb`: `sudo apt install ./Gitflow-linux-amd64-*.deb` |
+          | Linux (Fedora/RHEL) | `.rpm` |
+          | Linux (any) | `.AppImage` |
+          | Windows | `Gitflow-Windows-x64-Setup.exe` (if SmartScreen warns: "More info" → "Run anyway") |
+          | Windows (once per computer, as administrator) | `Gitflow-certificado.cer` + `Gitflow-instalar-certificado.ps1`: trust Gitflow's signature so the antivirus doesn't block it |
+          | macOS Apple Silicon | `Gitflow-macOS-arm64.zip` |
+          | macOS Intel | `Gitflow-macOS-x64.zip` |
+
+          **macOS:** unzip, move *Gitflow* to Applications and run once
+          `xattr -cr "/Applications/Gitflow.app"` (the app is not notarized by Apple).
+
+          Installed apps update themselves from these releases (Flows → Check for updates).
+          NOTES
+          } | sed 's/^          //' > ../notes.md
+          cat ../notes.md
+      - name: Publish
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Gitflow ${{ env.TAG }}
+          body_path: ../notes.md
+          files: artifacts/*
+          fail_on_unmatched_files: true
+      # Transition: installations made before the move still look for updates in the old public
+      # repository. While BRIDGE_REPOSITORY is set (variable of this repository), releases are published
+      # there too (needs RELEASES_TOKEN with access to it).
+      - name: Publish to the old repository (transition)
+        if: vars.BRIDGE_REPOSITORY != ''
+        uses: softprops/action-gh-release@v3
+        with:
+          repository: ${{ vars.BRIDGE_REPOSITORY }}
+          token: ${{ secrets.RELEASES_TOKEN }}
+          tag_name: ${{ env.TAG }}
+          name: Gitflow ${{ env.TAG }}
+          body_path: ../notes.md
+          files: artifacts/*
+          fail_on_unmatched_files: true
